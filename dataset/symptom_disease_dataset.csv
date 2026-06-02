@@ -1,0 +1,21 @@
+symptoms,disease,specialist
+fever cough headache,Flu,General Physician
+fever sore throat cough,Common Cold,General Physician
+chest pain shortness of breath,Heart Disease,Cardiologist
+skin rash itching,Allergy,Dermatologist
+headache nausea sensitivity to light,Migraine,Neurologist
+joint pain swelling,Arthritis,Orthopedic
+stomach pain vomiting,Food Poisoning,Gastroenterologist
+high sugar frequent urination,Diabetes,Endocrinologist
+anxiety panic insomnia,Anxiety Disorder,Psychiatrist
+back pain stiffness,Spine Disorder,Orthopedic
+headache dizziness,Migraine,Neurologist
+headache nausea,Migraine,Neurologist
+severe headache sensitivity to light,Migraine,Neurologist
+migraine headache vomiting,Migraine,Neurologist
+cough fever body pain,Flu,General Physician
+runny nose sneezing cold,Common Cold,General Physician
+skin redness itching rash,Allergy,Dermatologist
+chest tightness breathing problem,Heart Disease,Cardiologist
+joint stiffness knee pain,Arthritis,Orthopedic
+stress anxiety sleep issues,Anxiety Disorder,Psychiatrist
