@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from doctors import doctors_data
+from knowledge_base import KNOWLEDGE_BASE
+from auth import hash_password, verify_password, create_access_token, get_current_user, get_current_user_optional
 
 from fastapi.responses import FileResponse
 from reportlab.platypus import (
@@ -27,11 +29,11 @@ import google.generativeai as genai
 
 load_dotenv(".env")
 
-print("API KEY:", os.getenv("GEMINI_API_KEY"))
-
 genai.configure(
     api_key=os.getenv("GEMINI_API_KEY")
 )
+
+gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
 app = FastAPI()
 
@@ -120,13 +122,60 @@ class SymptomRequest(BaseModel):
     symptoms: str
 
 
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 @app.get("/")
 def home():
     return {"message": "MediMind AI Backend Running"}
 
 
+@app.post("/register")
+def register(data: RegisterRequest):
+    db = SessionLocal()
+    existing = db.query(User).filter(User.email == data.email).first()
+    if existing:
+        db.close()
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = User(name=data.name, email=data.email, password=hash_password(data.password))
+    db.add(user)
+    db.commit()
+    db.close()
+    return {"message": "User registered successfully"}
+
+
+@app.post("/login")
+def login(data: LoginRequest):
+    db = SessionLocal()
+    user = db.query(User).filter(User.email == data.email).first()
+    if not user or not verify_password(data.password, user.password):
+        db.close()
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_access_token({"sub": str(user.id)})
+    db.close()
+    return {"token": token, "name": user.name, "email": user.email}
+
+
+@app.get("/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == int(current_user["sub"])).first()
+    db.close()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"id": user.id, "name": user.name, "email": user.email}
+
+
 @app.post("/predict")
-def predict(data: SymptomRequest):
+def predict(data: SymptomRequest, current_user: dict = Depends(get_current_user_optional)):
 
     symptoms = data.symptoms.lower()
 
@@ -154,11 +203,13 @@ def predict(data: SymptomRequest):
     )
 
     db = SessionLocal()
+    user_id = int(current_user["sub"]) if current_user else None
     record = PredictionHistory(
     symptoms=symptoms,
     disease=prediction,
     specialist=specialist,
-    confidence=confidence
+    confidence=confidence,
+    user_id=user_id
     )
     
     db.add(record)
@@ -173,12 +224,15 @@ def predict(data: SymptomRequest):
     }
 
 @app.get("/history")
-def get_history():
+def get_history(current_user: dict = Depends(get_current_user)):
 
     db = SessionLocal()
+    user_id = int(current_user["sub"])
 
     records = db.query(
         PredictionHistory
+    ).filter(
+        PredictionHistory.user_id == user_id
     ).all()
 
     db.close()
@@ -196,14 +250,16 @@ def get_history():
 
 
 @app.delete("/history/{record_id}")
-def delete_history(record_id: int):
+def delete_history(record_id: int, current_user: dict = Depends(get_current_user)):
 
     db = SessionLocal()
+    user_id = int(current_user["sub"])
 
     record = db.query(
         PredictionHistory
     ).filter(
-        PredictionHistory.id == record_id
+        PredictionHistory.id == record_id,
+        PredictionHistory.user_id == user_id
     ).first()
 
     if not record:
@@ -295,22 +351,33 @@ def chat_ai(data: SymptomRequest):
     2
     )
 
+    # --- RAG: Retrieve matching knowledge base article ---
+    kb_article = KNOWLEDGE_BASE.get(prediction, {})
+    kb_description = kb_article.get("description", "")
+    kb_home_care = kb_article.get("home_care", [])
+    kb_warnings = kb_article.get("warning_signs", [])
+
+    kb_context = ""
+    if kb_article:
+        kb_context = f"""
+--- Verified Clinical Reference ---
+Description: {kb_description}
+Home Care:
+{chr(10).join('- ' + tip for tip in kb_home_care)}
+Warning Signs:
+{chr(10).join('- ' + w for w in kb_warnings)}
+--- End Reference ---
+"""
+
     prompt = f"""
-You are a healthcare assistant.
+You are a healthcare assistant. Use ONLY the verified clinical reference below to ground your advice. Do NOT add information beyond what is provided.
 
-Symptoms:
-{symptoms}
-
-Predicted Disease:
-{prediction}
-
-Recommended Specialist:
-{specialist}
-
-Suggested Medicines:
-{', '.join(medicines)}
-
-Give a SHORT response.
+Symptoms: {symptoms}
+Predicted Disease: {prediction}
+Recommended Specialist: {specialist}
+Suggested Medicines: {', '.join(medicines)}
+{kb_context}
+Give a SHORT, clean response. Maximum 100 words.
 
 Format exactly like this:
 
@@ -320,15 +387,10 @@ Condition:
 Specialist:
 <specialist>
 
-Possible Causes:
-- cause 1
-- cause 2
-- cause 3
-
-Advice:
-- advice 1
-- advice 2
-- advice 3
+Home Care:
+- tip 1
+- tip 2
+- tip 3
 
 See a doctor if:
 - warning 1
@@ -336,18 +398,37 @@ See a doctor if:
 
 Important:
 This is informational only and not a medical diagnosis.
-
-Maximum 120 words.
 """
 
-    response = gemini_model.generate_content(
-        prompt
+    recommended_doctors = doctors_data.get(
+        specialist,
+        []
     )
 
-    recommended_doctors = doctors_data.get(
-    specialist,
-    []
-    )
+    try:
+        response = gemini_model.generate_content(
+            prompt
+        )
+        ai_response = response.text
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+        # Fallback response using knowledge base data directly
+        home_care_text = chr(10).join('- ' + tip for tip in kb_home_care) if kb_home_care else "- Stay hydrated and get adequate rest\n- Monitor your symptoms closely"
+        warning_text = chr(10).join('- ' + w for w in kb_warnings) if kb_warnings else "- Symptoms persist for more than 3 days\n- Symptoms suddenly worsen"
+        ai_response = f"""Condition:
+{prediction}
+
+Specialist:
+{specialist}
+
+Home Care:
+{home_care_text}
+
+See a doctor if:
+{warning_text}
+
+Important:
+This is informational only and not a medical diagnosis."""
 
     return {
     "prediction": prediction,
@@ -355,7 +436,7 @@ Maximum 120 words.
     "confidence": confidence,
     "medicines": medicines,
     "doctors": recommended_doctors,
-    "response": response.text
+    "response": ai_response
     }
 
 
@@ -432,3 +513,20 @@ def users_count():
     db.close()
 
     return {"users": count}
+
+
+@app.get("/knowledge-base")
+def get_knowledge_base(q: str = ""):
+    """Return knowledge base articles. Optional ?q= to filter by condition name."""
+    if q:
+        query = q.strip().lower()
+        filtered = {
+            k: v for k, v in KNOWLEDGE_BASE.items()
+            if query in k.lower()
+        }
+        return {"articles": [
+            {"condition": k, **v} for k, v in filtered.items()
+        ]}
+    return {"articles": [
+        {"condition": k, **v} for k, v in KNOWLEDGE_BASE.items()
+    ]}
